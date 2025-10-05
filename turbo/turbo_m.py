@@ -245,3 +245,101 @@ class TurboM(Turbo1):
                     self.fX = np.vstack((self.fX, fX_init))
                     self._idx = np.vstack((self._idx, i * np.ones((self.n_init, 1), dtype=int)))
                     self.n_evals += self.n_init
+
+    def propose_next_config(
+        self,
+        X_obs: np.ndarray,
+        fX_obs: np.ndarray,
+        idx_obs: np.ndarray | None = None,
+        n_suggestions: int | None = None,
+    ):
+        """
+        Propose the next batch of configurations WITHOUT evaluating them.
+
+        Parameters
+        ----------
+        X_obs : ndarray, shape (N, d)
+            All configurations observed so far (original space).
+        fX_obs : ndarray, shape (N, 1) or (N,)
+            Corresponding objective values (minimization).
+        idx_obs : ndarray, shape (N, 1) or (N,), optional
+            Trust-region assignment for each row in X_obs. If None, we assume all
+            points belong to TR-0 (single-TR usage).
+        n_suggestions : int, optional
+            How many total points to return across all trust regions. Defaults to self.batch_size.
+
+        Returns
+        -------
+        X_next : ndarray, shape (n_suggestions, d)
+            Next configurations to evaluate (original space).
+        idx_next : ndarray, shape (n_suggestions, 1)
+            Trust-region index that proposed each configuration.
+
+        Notes
+        -----
+        - This method NEVER calls self.f; it only proposes points.
+        - It uses/updates self.hypers (per-TR cached GP hypers) to avoid retraining
+          when a TR didn't receive new data since the last call.
+        """
+        assert X_obs.ndim == 2 and X_obs.shape[1] == self.dim, "X_obs must be (N, d)"
+        fX_obs = fX_obs.reshape(-1, 1)
+        assert X_obs.shape[0] == fX_obs.shape[0], "X_obs and fX_obs must have the same N"
+
+        if idx_obs is None:
+            # default: single TR (all zeros)
+            idx_obs = np.zeros((X_obs.shape[0], 1), dtype=int)
+        else:
+            idx_obs = idx_obs.reshape(-1, 1)
+            assert idx_obs.shape[0] == X_obs.shape[0], "idx_obs length must match X_obs"
+
+        # How many to propose total (across TRs)
+        n_total = int(self.batch_size if n_suggestions is None else n_suggestions)
+        assert n_total >= 1
+
+        # We mirror the internal candidate-generation logic used by optimize(), but we feed it observations instead of sampling/evaluating ourselves.
+        X_cand = np.zeros((self.n_trust_regions, self.n_cand, self.dim))
+        y_cand = np.inf * np.ones((self.n_trust_regions, self.n_cand, self.batch_size))
+
+        # Generate candidates independently per TR from YOUR data
+        for i in range(self.n_trust_regions):
+            tr_mask = (idx_obs[:, 0] == i)
+            if not np.any(tr_mask):
+                # If a TR has no data at all, we can't train a GP there -> seed it with a Latin hypercube in unit cube so we can still compete in selection.
+                X_seed = latin_hypercube(max(self.n_init, 2 * self.dim), self.dim)
+                # fake large y so this TR won't win unless others are hopeless
+                y_seed = 1e9 * np.ones(X_seed.shape[0])
+                X_unit = X_seed
+                fX_std = y_seed
+                n_training_steps = self.n_training_steps  
+            else:
+                X_i = deepcopy(X_obs[tr_mask, :])
+                fX_i = deepcopy(fX_obs[tr_mask, 0].ravel())
+
+                X_unit = to_unit_cube(X_i, self.lb, self.ub)
+                fX_std = fX_i  # already objective values; standardization is internal to _create_candidates
+
+                # Only retrain if data changed since last time we touched this TR
+                n_training_steps = 0 if self.hypers[i] else self.n_training_steps
+
+            # Create new candidates (unit cube)
+            X_cand[i, :, :], y_cand[i, :, :], self.hypers[i] = self._create_candidates(
+                X=X_unit,
+                fX=fX_std,
+                length=self.length[i],
+                n_training_steps=n_training_steps,
+                hypers=self.hypers[i],
+            )
+
+        # Select winners across TRs (still in unit cube)
+        X_unit_next, idx_next = self._select_candidates(X_cand, y_cand)
+
+        # We may have asked for a total different from self.batch_size
+        # If n_total != self.batch_size, just keep the first n_total selections.
+        if n_total < self.batch_size:
+            X_unit_next = X_unit_next[:n_total, :]
+            idx_next = idx_next[:n_total, :]
+
+        # Map back to original variable space
+        X_next = from_unit_cube(X_unit_next, self.lb, self.ub)
+
+        return X_next, idx_next
