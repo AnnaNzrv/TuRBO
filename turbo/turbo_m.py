@@ -101,6 +101,7 @@ class TurboM(Turbo1):
         self.failcount = np.zeros(self.n_trust_regions, dtype=int)
         self.succcount = np.zeros(self.n_trust_regions, dtype=int)
         self.length = self.length_init * np.ones(self.n_trust_regions)
+        self._processed_counts = np.zeros(self.n_trust_regions, dtype=int)
 
     def _adjust_length(self, fX_next, i):
         assert i >= 0 and i <= self.n_trust_regions - 1
@@ -280,48 +281,72 @@ class TurboM(Turbo1):
         - This method NEVER calls self.f; it only proposes points.
         - It uses/updates self.hypers (per-TR cached GP hypers) to avoid retraining
           when a TR didn't receive new data since the last call.
+        - Before proposing, update TR lengths/counters using the most recent
+          finished observations *per TR*, but only once a TR has >= n_init points.
+        - The 'new' observations are those that arrived since the last call to ask()
+          (tracked via self._processed_counts).
         """
         assert X_obs.ndim == 2 and X_obs.shape[1] == self.dim, "X_obs must be (N, d)"
         fX_obs = fX_obs.reshape(-1, 1)
         assert X_obs.shape[0] == fX_obs.shape[0], "X_obs and fX_obs must have the same N"
 
         if idx_obs is None:
-            # default: single TR (all zeros)
             idx_obs = np.zeros((X_obs.shape[0], 1), dtype=int)
         else:
             idx_obs = idx_obs.reshape(-1, 1)
             assert idx_obs.shape[0] == X_obs.shape[0], "idx_obs length must match X_obs"
 
-        # How many to propose total (across TRs)
         n_total = int(self.batch_size if n_suggestions is None else n_suggestions)
         assert n_total >= 1
 
-        # We mirror the internal candidate-generation logic used by optimize(), but we feed it observations instead of sampling/evaluating ourselves.
+        # ---------- NEW: update TR state BEFORE proposing ----------
+        # We only start adjusting a TR once it has >= n_init observations.
+        # We only adjust for observations that are new since our last call.
+        for i in range(self.n_trust_regions):
+            tr_idx_all = np.where(idx_obs[:, 0] == i)[0]
+            cnt_i = len(tr_idx_all)
+            prev_cnt = int(self._processed_counts[i])
+
+            # We start accounting from the first index >= n_init
+            start_idx = max(prev_cnt, self.n_init)
+
+            if cnt_i > start_idx:
+                # The tail since we last processed (or since n_init if first time)
+                new_tail_idx = tr_idx_all[start_idx:cnt_i]
+                fX_new = fX_obs[new_tail_idx, :]
+
+                # Emulate the original _adjust_length contract using current full history
+                _fX_backup, _idx_backup = getattr(self, "fX", None), getattr(self, "_idx", None)
+                self.fX = fX_obs  # full history
+                self._idx = idx_obs
+                self._adjust_length(fX_next=fX_new, i=i)
+                self.fX, self._idx = _fX_backup, _idx_backup
+
+                # Force refit next time this TR is used
+                self.hypers[i] = {}
+                # Mark these as processed
+                self._processed_counts[i] = cnt_i
+
+        # ---------- Candidate generation (unchanged) ----------
         X_cand = np.zeros((self.n_trust_regions, self.n_cand, self.dim))
         y_cand = np.inf * np.ones((self.n_trust_regions, self.n_cand, self.batch_size))
 
-        # Generate candidates independently per TR from YOUR data
         for i in range(self.n_trust_regions):
             tr_mask = (idx_obs[:, 0] == i)
             if not np.any(tr_mask):
-                # If a TR has no data at all, we can't train a GP there -> seed it with a Latin hypercube in unit cube so we can still compete in selection.
                 X_seed = latin_hypercube(max(self.n_init, 2 * self.dim), self.dim)
-                # fake large y so this TR won't win unless others are hopeless
                 y_seed = 1e9 * np.ones(X_seed.shape[0])
                 X_unit = X_seed
                 fX_std = y_seed
-                n_training_steps = self.n_training_steps  
+                n_training_steps = self.n_training_steps
             else:
                 X_i = deepcopy(X_obs[tr_mask, :])
                 fX_i = deepcopy(fX_obs[tr_mask, 0].ravel())
 
                 X_unit = to_unit_cube(X_i, self.lb, self.ub)
-                fX_std = fX_i  # already objective values; standardization is internal to _create_candidates
-
-                # Only retrain if data changed since last time we touched this TR
+                fX_std = fX_i
                 n_training_steps = 0 if self.hypers[i] else self.n_training_steps
 
-            # Create new candidates (unit cube)
             X_cand[i, :, :], y_cand[i, :, :], self.hypers[i] = self._create_candidates(
                 X=X_unit,
                 fX=fX_std,
@@ -330,16 +355,10 @@ class TurboM(Turbo1):
                 hypers=self.hypers[i],
             )
 
-        # Select winners across TRs (still in unit cube)
         X_unit_next, idx_next = self._select_candidates(X_cand, y_cand)
-
-        # We may have asked for a total different from self.batch_size
-        # If n_total != self.batch_size, just keep the first n_total selections.
         if n_total < self.batch_size:
             X_unit_next = X_unit_next[:n_total, :]
             idx_next = idx_next[:n_total, :]
 
-        # Map back to original variable space
         X_next = from_unit_cube(X_unit_next, self.lb, self.ub)
-
         return X_next, idx_next
